@@ -1,13 +1,28 @@
-project(HttpsDnsProxy)
-cmake_minimum_required(VERSION 2.8)
+project(HttpsDnsProxy C)
+cmake_minimum_required(VERSION 3.7)
+
+# source: https://stackoverflow.com/a/27990434
+function(define_file_basename_for_sources targetname)
+  get_target_property(source_files "${targetname}" SOURCES)
+  foreach(sourcefile ${source_files})
+    get_filename_component(basename "${sourcefile}" NAME)
+    set_property(
+      SOURCE "${sourcefile}" APPEND
+      PROPERTY COMPILE_DEFINITIONS "__FILENAME__=\"${basename}\"")
+  endforeach()
+endfunction()
 
 set(CMAKE_BUILD_TYPE "Debug")
 #set(CMAKE_BUILD_TYPE "Release")
 
-#set(CMAKE_C_FLAGS "-Wall -Wextra --pedantic -Wno-strict-aliasing")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__FILENAME__='\"$(notdir $<)\"'")
+set(CMAKE_C_FLAGS "-Wall -Wextra --pedantic -Wno-strict-aliasing -Wno-variadic-macros")
 set(CMAKE_C_FLAGS_DEBUG "-g -DDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O2")
+
+if ((CMAKE_C_COMPILER_ID MATCHES GNU   AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 9) OR
+    (CMAKE_C_COMPILER_ID MATCHES Clang AND CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 10))
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-gnu-zero-variadic-macro-arguments -Wno-gnu-folding-constant")
+endif()
 
 find_package(Git)
 if(Git_FOUND)
@@ -43,7 +58,7 @@ if(NOT CLANG_TIDY_EXE)
   message(STATUS "clang-tidy not found.")
 else()
   message(STATUS "clang-tidy found: ${CLANG_TIDY_EXE}")
-  set(DO_CLANG_TIDY "${CLANG_TIDY_EXE}" "-fix" "-checks=*,-clang-analyzer-alpha.*,-misc-unused-parameters,-cert-err34-c,-google-readability-todo,-hicpp-signed-bitwise,-cppcoreguidelines-avoid-magic-numbers,-readability-magic-numbers")
+  set(DO_CLANG_TIDY "${CLANG_TIDY_EXE}" "-fix" "-checks=*,-clang-analyzer-alpha.*,-misc-unused-parameters,-cert-err34-c,-google-readability-todo,-hicpp-signed-bitwise,-cppcoreguidelines-avoid-magic-numbers,-readability-magic-numbers,-gnu-folding-constant,-gnu-zero-variadic-macro-arguments")
 endif()
 
 # The main binary
@@ -54,15 +69,11 @@ add_executable(${TARGET_NAME} ${SRC_LIST})
 set(LIBS ${LIBS} cares curl ev resolv)
 target_link_libraries(${TARGET_NAME} ${LIBS})
 
-set_source_files_properties(
-  src/options.c PROPERTIES
-  COMPILE_FLAGS "-DGIT_VERSION='\"${GIT_VERSION}\"'")
+define_file_basename_for_sources("https_dns_proxy")
 
-# clang-tidy
-set_target_properties(
-  ${TARGET_NAME} PROPERTIES
-  COMPILE_FLAGS "${WARNING_FLAGS}"
-)
+set_source_files_properties(
+  src/main.c src/options.c
+  PROPERTIES COMPILE_FLAGS "-DGIT_VERSION='\"${GIT_VERSION}\"'")
 
 if(CLANG_TIDY_EXE)
   set_target_properties(
@@ -71,7 +82,21 @@ if(CLANG_TIDY_EXE)
   )
 endif()
 
+install(TARGETS ${TARGET_NAME} DESTINATION bin)
+
+set(SERVICE_EXTRA_OPTIONS "")
+if(IS_DIRECTORY "/etc/munin/plugins" AND
+   IS_DIRECTORY "/etc/munin/plugin-conf.d")
+  set(SERVICE_EXTRA_OPTIONS "-s 300")
+  install(PROGRAMS munin/${TARGET_NAME}.plugin
+          DESTINATION /etc/munin/plugins/
+          RENAME ${TARGET_NAME})
+  install(FILES munin/${TARGET_NAME}.config
+          DESTINATION /etc/munin/plugin-conf.d/
+          RENAME ${TARGET_NAME})
+endif()
+
 configure_file(${TARGET_NAME}.service.in ${TARGET_NAME}.service)
 
-install(TARGETS ${TARGET_NAME} DESTINATION bin)
-install(FILES ${TARGET_NAME}.service DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/systemd/system/)
+install(FILES ${TARGET_NAME}.service
+        DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/systemd/system/)

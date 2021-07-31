@@ -14,6 +14,7 @@
 #include "https_client.h"
 #include "logging.h"
 #include "options.h"
+#include "stat.h"
 
 // Holds app state required for dns_server_cb.
 typedef struct {
@@ -21,6 +22,7 @@ typedef struct {
   struct curl_slist *resolv;
   const char *resolver_url;
   uint8_t using_dns_poller;
+  stat_t *stat;
 } app_state_t;
 
 typedef struct {
@@ -28,6 +30,8 @@ typedef struct {
   struct sockaddr_storage raddr;
   dns_server_t *dns_server;
   char* dns_req;
+  ev_tstamp start_tstamp;
+  stat_t *stat;
 } request_t;
 
 // Very very basic hostname parsing.
@@ -63,6 +67,7 @@ static int hostname_from_uri(const char* uri,
 static void sigint_cb(struct ev_loop *loop,
                       ev_signal __attribute__((__unused__)) *w,
                       int __attribute__((__unused__)) revents) {
+  ILOG("Shutting down gracefully. To force exit, send signal again.");
   ev_break(loop, EVBREAK_ALL);
 }
 
@@ -73,14 +78,27 @@ static void sigpipe_cb(struct ev_loop __attribute__((__unused__)) *loop,
 }
 
 static void https_resp_cb(void *data, char *buf, size_t buflen) {
-  DLOG("buflen %u\n", buflen);
   request_t *req = (request_t *)data;
+  DLOG("Received response for id: %hX, len: %zu", req->tx_id, buflen);
   if (req == NULL) {
-    FLOG("data NULL");
+    FLOG("%04hX: data NULL", req->tx_id);
   }
   free((void*)req->dns_req);
   if (buf != NULL) { // May be NULL for timeout, DNS failure, or something similar.
-    dns_server_respond(req->dns_server, (struct sockaddr*)&req->raddr, buf, buflen);
+    if (buflen < (int)sizeof(uint16_t)) {
+      WLOG("%04hX: Malformed response received (too short)", req->tx_id);
+    } else {
+      uint16_t response_id = ntohs(*((uint16_t*)buf));
+      if (req->tx_id != response_id) {
+        WLOG("DNS request and response IDs are not matching: %hX != %hX",
+             req->tx_id, response_id);
+      } else {
+        dns_server_respond(req->dns_server, (struct sockaddr*)&req->raddr, buf, buflen);
+        if (req->stat) {
+          stat_request_end(req->stat, buflen, ev_now(req->dns_server->loop) - req->start_tstamp);
+        }
+      }
+    }
   }
   free(req);
 }
@@ -90,27 +108,33 @@ static void dns_server_cb(dns_server_t *dns_server, void *data,
                           char *dns_req, size_t dns_req_len) {
   app_state_t *app = (app_state_t *)data;
 
-  DLOG("Received request for id: %04x, len: %d", tx_id, dns_req_len);
+  DLOG("Received request for id: %hX, len: %d", tx_id, dns_req_len);
 
   // If we're not yet bootstrapped, don't answer. libcurl will fall back to
   // gethostbyname() which can cause a DNS loop due to the nameserver listed
   // in resolv.conf being or depending on https_dns_proxy itself.
   if(app->using_dns_poller && (app->resolv == NULL || app->resolv->data == NULL)) {
-    WLOG("Query received before bootstrapping is completed, discarding.");
+    WLOG("%04hX: Query received before bootstrapping is completed, discarding.", tx_id);
     free(dns_req);
     return;
   }
 
   request_t *req = (request_t *)calloc(1, sizeof(request_t));
   if (req == NULL) {
-    FLOG("Out of mem");
+    FLOG("%04hX: Out of mem", tx_id);
   }
   req->tx_id = tx_id;
   memcpy(&req->raddr, addr, dns_server->addrlen);  // NOLINT(clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling)
   req->dns_server = dns_server;
   req->dns_req = dns_req; // To free buffer after https request is complete.
+  req->start_tstamp = ev_now(dns_server->loop);
+  req->stat = app->stat;
+
+  if (req->stat) {
+    stat_request_begin(app->stat, dns_req_len);
+  }
   https_client_fetch(app->https_client, app->resolver_url,
-                     dns_req, dns_req_len, app->resolv, https_resp_cb, req);
+                     dns_req, dns_req_len, app->resolv, req->tx_id, https_resp_cb, req);
 }
 
 static int addr_list_reduced(const char* full_list, const char* list) {
@@ -190,6 +214,7 @@ int main(int argc, char *argv[]) {
 
   logging_init(opt.logfd, opt.loglevel);
 
+  ILOG("Version " GIT_VERSION);
   ILOG("Built "__DATE__" "__TIME__".");
   ILOG("System c-ares: %s", ares_version(NULL));
   ILOG("System libcurl: %s", curl_version());
@@ -203,14 +228,18 @@ int main(int argc, char *argv[]) {
   //       valgrind will report a leak. :(
   struct ev_loop *loop = EV_DEFAULT;
 
+  stat_t stat;
+  stat_init(&stat, loop, opt.stats_interval);
+
   https_client_t https_client;
-  https_client_init(&https_client, &opt, loop);
+  https_client_init(&https_client, &opt, (opt.stats_interval ? &stat : NULL), loop);
 
   app_state_t app;
   app.https_client = &https_client;
   app.resolv = NULL;
   app.resolver_url = opt.resolver_url;
   app.using_dns_poller = 0;
+  app.stat = (opt.stats_interval ? &stat : NULL);
 
   dns_server_t dns_server;
   dns_server_init(&dns_server, loop, opt.listen_addr, opt.listen_port,
@@ -227,7 +256,7 @@ int main(int argc, char *argv[]) {
     // daemon() is non-standard. If needed, see OpenSSH openbsd-compat/daemon.c
     if (daemon(0, 0) == -1) {
       FLOG("daemon failed: %s", strerror(errno));
-}
+    }
   }
 
   ev_signal sigpipe;
@@ -259,18 +288,29 @@ int main(int argc, char *argv[]) {
   }
 
   ev_run(loop, 0);
+  DLOG("loop breaked");
 
-  if (!proxy_supports_name_resolution(opt.curl_proxy)) {
+  if (app.using_dns_poller) {
     dns_poller_cleanup(&dns_poller);
   }
-
   curl_slist_free_all(app.resolv);
 
+  logging_flush_cleanup(loop);
   ev_signal_stop(loop, &sigint);
+  ev_signal_stop(loop, &sigpipe);
+  dns_server_stop(&dns_server);
+  stat_stop(&stat);
+
+  DLOG("re-entering loop");
+  ev_run(loop, 0);
+  DLOG("loop finished all events");
+
   dns_server_cleanup(&dns_server);
   https_client_cleanup(&https_client);
+  stat_cleanup(&stat);
 
   ev_loop_destroy(loop);
+  DLOG("loop destroyed");
 
   curl_global_cleanup();
   logging_cleanup();

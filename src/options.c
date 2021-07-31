@@ -34,11 +34,12 @@ void options_init(struct Options *opt) {
   opt->resolver_url = "https://dns.google/dns-query";
   opt->curl_proxy = NULL;
   opt->use_http_1_1 = 0;
+  opt->stats_interval = 0;
 }
 
 int options_parse_args(struct Options *opt, int argc, char **argv) {
   int c = 0;
-  while ((c = getopt(argc, argv, "a:c:p:du:g:b:i:4r:e:t:l:vxV")) != -1) {
+  while ((c = getopt(argc, argv, "a:c:p:du:g:b:i:4r:e:t:l:vxs:hV")) != -1) {
     switch (c) {
     case 'a': // listen_addr
       opt->listen_addr = optarg;
@@ -84,13 +85,17 @@ int options_parse_args(struct Options *opt, int argc, char **argv) {
     case 'x': // http/1.1
       opt->use_http_1_1 = 1;
       break;
-    case 'V': // version
-      printf("%s\n", GIT_VERSION);
-      exit(0);
+    case 's': // stats interval
+      opt->stats_interval = atoi(optarg);
       break;
     case '?':
       printf("Unknown option '-%c'\n", c);
+      // fallthrough
+    case 'h':
       return -1;
+    case 'V': // version
+      printf("%s\n", GIT_VERSION);
+      exit(0);
     default:
       printf("Unknown state!");
       exit(EXIT_FAILURE);
@@ -144,6 +149,10 @@ int options_parse_args(struct Options *opt, int argc, char **argv) {
     printf("DNS servers polling interval must be between 5 and 3600.\n");
     return -1;
   }
+  if (opt->stats_interval < 0 || opt->stats_interval > 3600) {
+    printf("Statistic interval must be between 0 and 3600.\n");
+    return -1;
+  }
   return 0;
 }
 
@@ -152,9 +161,9 @@ void options_show_usage(int __attribute__((unused)) argc, char **argv) {
   options_init(&defaults);
   printf("Usage: %s [-a <listen_addr>] [-p <listen_port>]\n", argv[0]);
   printf("        [-d] [-u <user>] [-g <group>] [-b <dns_servers>]\n");
-  printf("        [-r <resolver_url>] [-e <subnet_addr>]\n");
-  printf("        [-t <proxy_server>] [-l <logfile>] -c <dscp_codepoint>\n");
-  printf("        [-x] [-v]+\n\n");
+  printf("        [-i <polling_interval>] [-4] [-r <resolver_url>]\n");
+  printf("        [-t <proxy_server>] [-l <logfile>] [-c <dscp_codepoint>]\n");
+  printf("        [-x] [-q] [-s <statistic_interval>] [-v]+ [-V] [-h]\n\n");
   printf("  -a listen_addr         Local IPv4/v6 address to bind to. (%s)\n",
          defaults.listen_addr);
   printf("  -p listen_port         Local port to bind to. (%d)\n",
@@ -184,8 +193,12 @@ void options_show_usage(int __attribute__((unused)) argc, char **argv) {
   printf("                         connections.\n");
   printf("  -x                     Use HTTP/1.1 instead of HTTP/2. Useful with broken\n"
          "                         or limited builds of libcurl. (false)\n");
+  printf("  -s statistic_interval  Optional statistic printout interval.\n"\
+         "                         (Default: %d, Disabled: 0, Min: 1, Max: 3600)\n",
+         defaults.stats_interval);
   printf("  -v                     Increase logging verbosity. (INFO)\n");
   printf("  -V                     Print version and exit.\n");
+  printf("  -h                     Print help and exit.\n");
   options_cleanup(&defaults);
 }
 

@@ -4,6 +4,7 @@
 #include <curl/curl.h>
 
 #include "options.h"
+#include "stat.h"
 
 #define MAX_TOTAL_CONNECTIONS 8
 
@@ -14,6 +15,8 @@ typedef void (*https_response_cb)(void *data, char *buf, size_t buflen);
 struct https_fetch_ctx {
   CURL *curl;
 
+  uint16_t id;
+
   https_response_cb cb;
   void *cb_data;
 
@@ -21,12 +24,6 @@ struct https_fetch_ctx {
   size_t buflen;
 
   struct https_fetch_ctx *next;
-};
-
-// Internal: Holds state on a socket watcher.
-struct https_fd_watcher {
-  ev_io watcher;
-  struct https_fd_watcher *next;
 };
 
 // Holds state on the whole multiplexed CURL machine.
@@ -41,14 +38,16 @@ typedef struct {
   int still_running;
 
   options_t *opt;
+  stat_t *stat;
 } https_client_t;
 
-void https_client_init(https_client_t *c, options_t *opt, struct ev_loop *loop);
+void https_client_init(https_client_t *c, options_t *opt,
+                       stat_t *stat, struct ev_loop *loop);
 
 void https_client_fetch(https_client_t *c, const char *url,
                         const char* postdata, size_t postdata_len,
-                        struct curl_slist *resolv, https_response_cb cb,
-                        void *data);
+                        struct curl_slist *resolv, uint16_t id,
+                        https_response_cb cb, void *data);
 
 // Used to reset state of libcurl because streaming connections + IP changes
 // seem to cause curl to flip out.
